@@ -32,6 +32,15 @@
   </form>
 </section>
 
+<section class="card">
+  <h2>区间核对</h2>
+  <p class="hint">
+    下游按区间取测序结果时，左对齐后的规范坐标可能落在区间外，而等价写法却在区间内。
+    用区间核对找出完整收录相交变异所需的最小扩展区间。
+  </p>
+  <p><a class="detail-link" href="{{ url_for('interval_check') }}">进入区间核对 →</a></p>
+</section>
+
 {% if reference %}
 <section class="card">
   <h2>样本列表（当前参考 #{{ reference.id }}）</h2>

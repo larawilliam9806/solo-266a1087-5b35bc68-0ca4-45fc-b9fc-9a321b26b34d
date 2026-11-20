@@ -1,10 +1,16 @@
-"""业务逻辑：参考/样本上传、重验、替换、汇总查询。"""
+"""业务逻辑：参考/样本上传、重验、替换、汇总查询、区间核对。"""
 
 from __future__ import annotations
 
 import sqlite3
 
-from .db import read_tx, write_tx
+from .db import (
+    build_reference_ranges,
+    ensure_ranges,
+    prune_reference_ranges,
+    read_tx,
+    write_tx,
+)
 from .normalization import (
     MAX_NAME_LEN,
     ValidationError,
@@ -46,6 +52,8 @@ def upload_reference(raw: bytes) -> dict:
                     (row["id"],),
                 ).fetchone()
             )
+        # 新参考下的等价范围随重验结果一同建立（同一写事务）
+        build_reference_ranges(conn, new_ref_id, sequence)
     return {
         "reference_id": new_ref_id,
         "length": len(sequence),
@@ -93,13 +101,44 @@ def upload_sample(name: str, raw: bytes) -> dict:
         )
         sample_id = cur.lastrowid
         _insert_variants(conn, sample_id, variants)
+        _index_variants(conn, ref_id, variants)
+        # 重传可能删掉了旧版本独有的变异：失去最后一份有效检出的范围不再参与扩展
+        prune_reference_ranges(conn, ref_id)
+        replaced = old is not None
+
+    return {"sample": name, "count": len(variants), "replaced": replaced}
+
+
+def delete_sample(sample_id: int) -> None:
+    with write_tx() as conn:
+        row = conn.execute(
+            "SELECT s.reference_id FROM samples s WHERE s.id=?", (sample_id,)
+        ).fetchone()
+        conn.execute("DELETE FROM samples WHERE id=?", (sample_id,))
+        # 当前参考上已无有效检出的变异不再参与区间扩展
+        if row is not None and row["reference_id"] is not None:
+            latest = conn.execute(
+                "SELECT id FROM reference_sequences ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if latest is not None and latest["id"] == row["reference_id"]:
+                prune_reference_ranges(conn, latest["id"])
 
     return {"sample": name, "count": len(variants), "replaced": old is not None}
 
 
 def delete_sample(sample_id: int) -> None:
     with write_tx() as conn:
+        row = conn.execute(
+            "SELECT s.reference_id FROM samples s WHERE s.id=?", (sample_id,)
+        ).fetchone()
         conn.execute("DELETE FROM samples WHERE id=?", (sample_id,))
+        # 当前参考上已无有效检出的变异不再参与区间扩展
+        if row is not None and row["reference_id"] is not None:
+            latest = conn.execute(
+                "SELECT id FROM reference_sequences ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if latest is not None and latest["id"] == row["reference_id"]:
+                prune_reference_ranges(conn, latest["id"])
 
 
 def _revalidate_sample(
@@ -128,7 +167,20 @@ def _revalidate_sample(
         (ref_id, sample_id),
     )
     _insert_variants(conn, sample_id, variants)
+    _index_variants(conn, ref_id, variants)
     return True
+
+
+def _index_variants(
+    conn: sqlite3.Connection, ref_id: int, variants: list[dict]
+) -> None:
+    """为一份样本的规范变异补写等价范围（与检出记录同一写事务）。"""
+    row = conn.execute(
+        "SELECT sequence FROM reference_sequences WHERE id=?", (ref_id,)
+    ).fetchone()
+    if row is None:
+        return
+    ensure_ranges(conn, ref_id, row["sequence"], variants)
 
 
 def _insert_variants(
@@ -222,3 +274,121 @@ def get_variant_detail(pos: int, ref: str, alt: str) -> dict | None:
         if not rows:
             return None
         return {"pos": pos, "ref": ref, "alt": alt, "rows": rows}
+
+
+# --------------------------------------------------------------------------- #
+# 区间核对
+# --------------------------------------------------------------------------- #
+def get_interval_form() -> dict:
+    """区间核对页面所需的基础数据：当前参考与表单默认值（只读快照）。"""
+    with read_tx() as conn:
+        ref = conn.execute(
+            "SELECT id, sequence, length FROM reference_sequences "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return {
+        "reference": ref,
+        "reference_id": ref["id"] if ref else None,
+        "start": "",
+        "end": "",
+        "error": None,
+        "checked": False,
+        "result": None,
+    }
+
+
+def stale_reference_message(
+    expected_reference_id: int | None, current_id: int | None
+) -> str:
+    """换版后用旧表单查询时的提示。"""
+    return (
+        f"查询表单对应参考 #{expected_reference_id}，当前参考已是 "
+        f"#{current_id}，请重新选择参考后重试。"
+    )
+
+
+class StaleReferenceError(Exception):
+    """查询表单携带的参考版本已不是当前参考。"""
+
+
+def parse_interval(start: str, end: str, genome_len: int) -> tuple[int, int]:
+    """解析从 1 起算的闭区间，返回 (start, end)。
+
+    起点/终点必须是纯数字正整数；不做静默截断，非法输入直接报错。
+    """
+    def _to_int(value: str, name: str) -> int:
+        text = str(value).strip()
+        if not text.isdigit() or int(text) < 1:
+            raise ValidationError(f"{name} 必须是从 1 起算的正整数。")
+        return int(text)
+
+    lo = _to_int(start, "区间起点")
+    hi = _to_int(end, "区间终点")
+    if lo > hi:
+        raise ValidationError(f"区间起点（{lo}）不能大于终点（{hi}）。")
+    if hi > genome_len:
+        raise ValidationError(f"区间终点 {hi} 超出参考序列长度 {genome_len}。")
+    return lo, hi
+
+
+def check_interval(
+    start: str, end: str, expected_reference_id: int | None = None
+) -> dict:
+    """核对区间：返回完整收录相交变异所需的最小扩展区间及新增收录的变异。
+
+    * 只读同一快照中的等价范围索引与检出记录。
+    * 扩展后新碰到的变异继续完整收录，直到区间边界稳定（迭代不动点）。
+    * 表单携带的参考版本（``expected_reference_id``）不是当前参考时抛
+      StaleReferenceError；未携带视为不指定版本。
+    """
+    with read_tx() as conn:
+        ref = conn.execute(
+            "SELECT id, sequence, length FROM reference_sequences "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if ref is None:
+            raise ValidationError("请先上传参考序列，再使用区间核对。")
+        if expected_reference_id is not None and expected_reference_id != ref["id"]:
+            raise StaleReferenceError(
+                stale_reference_message(expected_reference_id, ref["id"])
+            )
+
+        orig_lo, orig_hi = parse_interval(start, end, ref["length"])
+        req_lo, req_hi = orig_lo, orig_hi
+
+        # 扩展：收录所有与当前区间相交的变异；新收录的变异若越界则继续外扩，
+        # 直到边界不再变化。范围行都来自当前参考的有效检出，不会跨版本混算。
+        prev = None
+        while prev != (req_lo, req_hi):
+            prev = (req_lo, req_hi)
+            row = conn.execute(
+                "SELECT MIN(lo) AS lo, MAX(hi) AS hi FROM variant_ranges "
+                "WHERE reference_id=? AND lo <= ? AND hi >= ?",
+                (ref["id"], req_hi, req_lo),
+            ).fetchone()
+            if row["lo"] is not None:
+                req_lo = min(req_lo, row["lo"])
+                req_hi = max(req_hi, row["hi"])
+
+        hits = conn.execute(
+            "SELECT r.pos, r.ref, r.alt, r.kind, r.lo, r.hi, "
+            "(SELECT COUNT(DISTINCT v.sample_id) FROM sample_variants v "
+            " JOIN samples s ON s.id=v.sample_id "
+            " WHERE s.reference_id=? AND s.status='VALID' "
+            "   AND v.pos=r.pos AND v.ref=r.ref AND v.alt=r.alt) AS n_samples "
+            "FROM variant_ranges r "
+            "WHERE r.reference_id=? AND r.lo <= ? AND r.hi >= ? "
+            "ORDER BY r.pos, r.ref, r.alt",
+            (ref["id"], ref["id"], req_hi, req_lo),
+        ).fetchall()
+
+        return {
+            "reference": ref,
+            "requested": (orig_lo, orig_hi),
+            "expanded": (req_lo, req_hi),
+            "hits": hits,
+            # 扩展后收录、但原区间未能完整覆盖的变异
+            "uncovered": [
+                h for h in hits if not (h["lo"] >= orig_lo and h["hi"] <= orig_hi)
+            ],
+        }

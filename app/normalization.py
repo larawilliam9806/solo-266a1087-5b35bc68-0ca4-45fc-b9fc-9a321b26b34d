@@ -194,15 +194,23 @@ def normalize_variant(pos: int, ref: str, alt: str, genome: str) -> tuple[int, s
 # --------------------------------------------------------------------------- #
 # 内部工具
 # --------------------------------------------------------------------------- #
-def _classify(ref: str, alt: str, lineno: int) -> str:
+def variant_kind(ref: str, alt: str) -> str | None:
+    """返回规范等位基因的变异类型（SNP/INS/DEL），非平台支持形状返回 None。"""
     if len(ref) == 1 and len(alt) == 1:
-        if ref == alt:
-            raise ValidationError(f"第 {lineno} 行：REF 与 ALT 相同，不是变异。")
-        return "SNP"
+        return None if ref == alt else "SNP"
     if len(ref) == 1 and len(alt) >= 2:
         return "INS"
     if len(ref) >= 2 and len(alt) == 1:
         return "DEL"
+    return None
+
+
+def _classify(ref: str, alt: str, lineno: int) -> str:
+    kind = variant_kind(ref, alt)
+    if kind is not None:
+        return kind
+    if len(ref) == 1 and len(alt) == 1:
+        raise ValidationError(f"第 {lineno} 行：REF 与 ALT 相同，不是变异。")
     raise ValidationError(
         f"第 {lineno} 行：仅支持单碱基替换、带锚碱基的纯插入或纯缺失；"
         f"收到 REF='{ref}' ALT='{alt}'。"

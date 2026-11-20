@@ -15,7 +15,7 @@ from flask import (
 )
 
 from . import services
-from .db import init_app
+from .db import init_app, migrate
 from .normalization import ValidationError
 
 
@@ -28,6 +28,7 @@ def create_app() -> Flask:
     app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB
 
     init_app(app)
+    migrate(app)
 
     @app.get("/")
     def index():
@@ -90,6 +91,39 @@ def create_app() -> Flask:
         if data is None:
             abort(404)
         return render_template("variant.html", variant=data)
+
+    @app.get("/interval")
+    def interval_check():
+        data = services.get_interval_form()
+        return render_template("interval.html", **data)
+
+    @app.get("/interval/check")
+    def interval_check_submit():
+        start = request.args.get("start", "")
+        end = request.args.get("end", "")
+        ref_id = request.args.get("reference_id", "")
+        expected = int(ref_id) if ref_id.isdigit() else None
+        data = services.get_interval_form()
+        if expected is not None and data["reference_id"] != expected:
+            data["stale"] = True
+        try:
+            result = services.check_interval(start, end, expected)
+        except services.StaleReferenceError as exc:
+            data["error"] = str(exc)
+            data["start"], data["end"] = start, end
+            return render_template("interval.html", **data), 409
+        except ValidationError as exc:
+            data["error"] = str(exc)
+            data["start"], data["end"] = start, end
+            return render_template("interval.html", **data), 400
+        data.update(
+            checked=True,
+            result=result,
+            start=str(start).strip(),
+            end=str(end).strip(),
+            reference_id=result["reference"]["id"],
+        )
+        return render_template("interval.html", **data)
 
     @app.get("/healthz")
     def healthz():

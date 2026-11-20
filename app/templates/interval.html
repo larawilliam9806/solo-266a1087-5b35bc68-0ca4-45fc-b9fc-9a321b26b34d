@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}区间核对{% endblock %}
+{% block content %}
+<section class="card">
+  <p><a href="{{ url_for('index') }}">← 返回汇总</a></p>
+  <h2>区间核对</h2>
+  <p class="hint">
+    输入当前参考上从 1 起算的闭区间。系统会找出所有与之相交的变异，并按等价写法范围
+    把区间扩展到能完整收录它们的最小闭区间；扩展过程中新碰到的变异也会继续收录，
+    直到边界稳定。单碱基替换按位点计，插入按左锚位点计，缺失按实际删去的碱基计。
+  </p>
+
+  {% if not reference %}
+    <p class="empty">尚未上传参考序列，请先在首页上传参考后再使用区间核对。</p>
+  {% else %}
+  <form method="get" action="{{ url_for('interval_check_submit') }}" class="upload">
+    <input type="hidden" name="reference_id" value="{{ reference_id }}">
+    <label>参考 #{{ reference_id }}（长度 {{ reference.length }} bp）</label>
+    <input type="text" name="start" value="{{ start }}" placeholder="起点，如 1" inputmode="numeric" required>
+    <input type="text" name="end" value="{{ end }}" placeholder="终点，如 10" inputmode="numeric" required>
+    <button type="submit" class="primary">核对区间</button>
+  </form>
+  {% endif %}
+
+  {% if stale %}
+    <div class="flash flash-warning">表单对应的参考已不是当前参考，请重新输入区间后重试。</div>
+  {% endif %}
+  {% if error %}
+    <div class="flash flash-error">{{ error }}</div>
+  {% endif %}
+  {% if reference and checked and result %}
+  <dl class="meta" style="margin-top:16px">
+    <dt>原区间</dt><dd>{{ result.requested[0] }} – {{ result.requested[1] }}</dd>
+    <dt>最小扩展区间</dt><dd><strong>{{ result.expanded[0] }} – {{ result.expanded[1] }}</strong></dd>
+    <dt>扩展后收录、原区间未完整覆盖</dt><dd>{{ result.uncovered|length }} 个变异</dd>
+  </dl>
+  {% if result.expanded != result.requested %}
+    <p class="hint">
+      原区间无法完整覆盖 {{ result.uncovered|length }} 个变异，已向外扩展到
+      {{ result.expanded[0] }} – {{ result.expanded[1] }} 才能完整收录。
+    </p>
+  {% else %}
+    <p class="hint">原区间已能完整覆盖所有相交变异，无需扩展（共 {{ result.hits|length }} 个）。</p>
+  {% endif %}
+
+  <table>
+    <thead>
+      <tr>
+        <th>规范位点</th><th>REF</th><th>ALT</th><th>类型</th>
+        <th>等价范围</th><th>原区间完整覆盖</th><th>检出样本数</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for v in result.hits %}
+      {% set covered = v.lo >= result.requested[0] and v.hi <= result.requested[1] %}
+      <tr class="{{ '' if covered else 'row-warn' }}">
+        <td>{{ v.pos }}</td>
+        <td class="mono">{{ v.ref }}</td>
+        <td class="mono">{{ v.alt }}</td>
+        <td><span class="tag tag-kind">{{ v.kind }}</span></td>
+        <td class="mono">{{ v.lo }} – {{ v.hi }}</td>
+        <td>{% if covered %}<span class="tag tag-ok">是</span>{% else %}<span class="tag tag-bad">否</span>{% endif %}</td>
+        <td><strong>{{ v.n_samples }}</strong></td>
+        <td><a class="detail-link"
+               href="{{ url_for('variant_detail', pos=v.pos, alleles=v.ref ~ '>' ~ v.alt) }}">详情 →</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if not result.hits %}
+    <p class="empty">该区间内没有任何有效检出变异。</p>
+  {% endif %}
+  {% endif %}
+</section>
+{% endblock %}

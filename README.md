@@ -39,6 +39,8 @@ DATABASE_PATH=/tmp/dev.db flask --app 'app:create_app()' run --debug
    - GT 仅允许 `0/1` 或 `1/1`
    - 每行先核对 REF 与当前参考是否一致，再做左对齐归一化
 3. 首页按**规范变异**列出检出样本数；点详情查看各样本基因型与原始位点。
+4. **区间核对**（导航栏「区间核对」）：输入当前参考上从 1 起算的闭区间，
+   得到完整收录相交变异所需的最小扩展区间与新增收录的规范变异。
 
 ## 关键规则
 
@@ -53,6 +55,37 @@ DATABASE_PATH=/tmp/dev.db flask --app 'app:create_app()' run --debug
 
 因此重复序列中的等价写法（如 `GCTTTGC` 上 `(3,T,TT)`、`(4,T,TT)`、`(5,T,TT)`）
 都会归一化为同一个规范键 `(2,C,CT)`，从而被识别为同一变异。
+
+### 等价写法范围与区间核对
+
+规范坐标是每个变异的一种写法。下游按区间取数时，**左对齐后的坐标可能落在区间外，
+而等价写法却在区间内**，直接按规范坐标裁剪会漏掉这条变异。
+
+平台为每个变异记录它在当前参考上的**等价写法范围**（闭区间 `[lo, hi]`），
+口径按变异类型区分：
+
+| 类型 | 范围口径 |
+| --- | --- |
+| 单碱基替换 | 位点本身（`lo == hi == pos`） |
+| 插入 | 左锚位点；等价滑动时插入序列同步旋转 |
+| 缺失 | 实际删去的碱基位置；锚碱基**不**计入 |
+
+区间核对流程：
+
+1. 输入从 1 起算的合法闭区间（越界/倒序报错）；
+2. 收录所有与区间相交的变异，把区间向外扩展到能完整覆盖它们的**最小**闭区间；
+3. 扩展后新碰到的变异继续完整收录，重复直到边界稳定（不动点）；
+4. 返回扩展区间，并单独列出「扩展后收录、但原区间未完整覆盖」的规范变异。
+
+一致性约束：
+
+- `variant_ranges` 是派生索引，与检出记录在**同一写事务**内生效：上传、重传、
+  换参考重验都会同步写入/替换，上传失败整体回滚；
+- 查询只读**同一快照**中的入库范围与检出记录，不会跨版本混算；
+- 变异在当前参考下**失去最后一份有效检出**后，其范围随之删除，不再参与扩展；
+- 重传/删除样本时收敛当前参考上的失效范围；
+- 换参考后用旧表单查询（`reference_id` 不再是最新）会提示重新选择参考，不再返回结果；
+- 旧库启动时由 `migrate()` 在一个写事务里为已有有效检出补建范围，检出记录不变。
 
 ### 事务与一致性
 
@@ -73,11 +106,12 @@ DATABASE_PATH=/tmp/dev.db flask --app 'app:create_app()' run --debug
 app/
   __init__.py        # Flask 工厂与路由
   normalization.py   # 纯函数：解析、校验、左对齐归一化（无 Flask 依赖）
-  db.py              # SQLite 连接、WAL、事务、建表
-  services.py        # 上传/重验/替换/汇总业务逻辑
+  equivalence.py     # 纯函数：规范变异在当前参考上的等价写法范围
+  db.py              # SQLite 连接、WAL、事务、建表、旧库补建
+  services.py        # 上传/重验/替换/汇总/区间核对业务逻辑
   templates/         # Jinja2 页面
   static/style.css
-tests/               # unittest：归一化单测、随机性质测试、端到端集成测试
+tests/               # unittest：归一化单测、随机性质测试、区间核对、端到端集成测试
 docker/entrypoint.sh
 Dockerfile
 docker-compose.yml
@@ -91,6 +125,7 @@ python -m unittest discover -s tests -v
 
 - `test_normalization.py`：解析、边界、等价变异左对齐、重复拒绝等
 - `test_properties.py`：4000 个随机变异，验证「单倍型保持」「同事件同规范键」
+- `test_interval.py`：等价范围口径与暴力枚举一致、区间扩展稳定性、旧库补建、换参考提示
 - `test_app.py`：Flask 端到端流程（上传、替换、换参考重验、错误隔离、删除）
 
 ## HTTP 接口
@@ -102,4 +137,6 @@ python -m unittest discover -s tests -v
 | POST | `/samples` | 上传/重传样本（字段 `name`、`sample`） |
 | POST | `/samples/<id>/delete` | 删除样本 |
 | GET | `/variants/<pos>/<REF>><ALT>` | 变异详情：样本、GT、原始位点 |
+| GET | `/interval` | 区间核对表单 |
+| GET | `/interval/check?start=&end=&reference_id=` | 核对闭区间：最小扩展区间、收录变异、未覆盖变异 |
 | GET | `/healthz` | 健康检查 |

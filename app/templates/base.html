@@ -10,6 +10,10 @@
 <header>
   <h1><a href="{{ url_for('index') }}">变异归一化汇总平台</a></h1>
   <p class="subtitle">Flask + SQLite · 参考左对齐 · 多样本交叉检出</p>
+  <nav class="topnav">
+    <a href="{{ url_for('index') }}">变异汇总</a>
+    <a href="{{ url_for('interval_check') }}">区间核对</a>
+  </nav>
 </header>
 <main>
   {% with messages = get_flashed_messages(with_categories=true) %}
